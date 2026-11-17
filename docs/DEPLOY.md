@@ -57,28 +57,10 @@ couples Touchline's uptime to another project's `docker compose down`.
 
 No published port. The app reaches it by service name on the project network.
 
-```yaml
-# compose.yml — the database half
-services:
-  touchline-db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: touchline
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it}
-      POSTGRES_DB: touchline
-    volumes:
-      - touchline-pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U touchline"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks: [internal]
-
-volumes:
-  touchline-pgdata:
-```
+The database service is already written in **[`compose.yml`](../compose.yml)**
+at the repository root — `postgres:16-alpine`, a named volume, a `pg_isready`
+healthcheck, and the `internal` network only, so nothing on Caddy's network
+can reach it.
 
 Apply the schema from inside the project network:
 
@@ -122,24 +104,13 @@ docker inspect deploy-caddy-1 \
 Join it as external, and keep the database on a separate internal network so
 Caddy cannot reach it:
 
-```yaml
-services:
-  touchline-app:
-    build: .
-    restart: unless-stopped
-    env_file: .env.production
-    depends_on:
-      touchline-db:
-        condition: service_healthy
-    expose: ["3000"]          # internal only — 3000 is taken on the host
-    networks: [internal, edge]
+The app service is in the same **[`compose.yml`](../compose.yml)**. It joins
+both networks, publishes no host port, and waits for `touchline-migrate` to
+exit 0 before starting — so the app never meets a schema it does not expect.
 
-networks:
-  internal:
-  edge:
-    external: true
-    name: <the network from the command above>
-```
+One value needs filling in before the first run: `networks.edge.name`, which
+is currently `CHANGEME-caddy-network`. Set it to whatever the `docker inspect`
+above printed.
 
 Then the site block in the `deploy` project's Caddyfile:
 

@@ -1,0 +1,19 @@
+node_modules
+.next
+.git
+.gitignore
+npm-debug.log*
+
+# Secrets must never enter the build context. The runtime gets them from
+# env_file at run time, not baked into a layer.
+.env
+.env.*
+!.env.example
+
+docs
+README.md
+scripts
+*.tar.gz
+
+# drizzle/ is NOT excluded: drizzle-kit migrate reads drizzle/meta/_journal.json
+# to know which migrations have run. Without it, it reapplies everything.

@@ -1,0 +1,81 @@
+# Touchline — production stack.
+#
+# Shaped by what is already on the box (docs/VPS-INVENTORY.md):
+#   · No host port is published. 3000 is taken by zaaka-pi-auction-app-1,
+#     and Caddy reaches containers by name anyway.
+#   · Own Postgres, like every other project here. Sharing one would couple
+#     Touchline's uptime to another project's `compose down`.
+#   · Two networks: the database is on `internal` only, so nothing on the
+#     Caddy network can reach it.
+#
+# Before the first run, set `edge.name` below to Caddy's actual network:
+#   docker inspect deploy-caddy-1 \
+#     --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}'
+
+# Pinned, so the project name does not depend on the directory it is cloned into.
+name: touchline
+
+services:
+  touchline-db:
+    image: postgres:16-alpine
+    container_name: touchline-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: touchline
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: touchline
+    volumes:
+      - touchline-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U touchline -d touchline']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [internal]
+
+  # Runs to completion, then exits 0. The app waits for it.
+  touchline-migrate:
+    build:
+      context: .
+      target: migrate
+    container_name: touchline-migrate
+    restart: 'no'
+    environment:
+      DATABASE_URL: postgres://touchline:${POSTGRES_PASSWORD:?}@touchline-db:5432/touchline
+    depends_on:
+      touchline-db:
+        condition: service_healthy
+    networks: [internal]
+
+  touchline-app:
+    build:
+      context: .
+      target: runtime
+    container_name: touchline-app
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      DATABASE_URL: postgres://touchline:${POSTGRES_PASSWORD:?}@touchline-db:5432/touchline
+    depends_on:
+      touchline-db:
+        condition: service_healthy
+      touchline-migrate:
+        condition: service_completed_successfully
+    # Internal only. Caddy addresses this as touchline-app:3000.
+    expose: ['3000']
+    networks: [internal, edge]
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+volumes:
+  touchline-pgdata:
+
+networks:
+  internal:
+  edge:
+    external: true
+    name: CHANGEME-caddy-network
