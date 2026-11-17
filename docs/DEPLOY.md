@@ -4,87 +4,161 @@ The box is not empty. Every step here is written so that a mistake takes down
 this project and nothing else. Work through it in order — it maps onto the
 Tue–Sat tasks in the build tracker.
 
-## Tue — Inventory
+## Tue — Inventory ✅ done 17 Nov
 
-Before touching anything, write down what is already there. You will need this
-on Friday when you add the vhost.
+See **[docs/VPS-INVENTORY.md](./VPS-INVENTORY.md)** for the findings. In short:
 
-```sh
-ss -tulpn                      # what is listening, on which ports
-docker ps -a                   # containers, running or not
-systemctl list-units --type=service --state=running
-nginx -T 2>/dev/null | head -50    # or: caddy adapt --config /etc/caddy/Caddyfile
-ls /etc/letsencrypt/live/ 2>/dev/null
-df -h && free -m
-```
+- **Everything on that box is Docker.** No proxy or database packages on the
+  host at all.
+- **Caddy is the edge**, in the `deploy` compose project, with automatic TLS.
+- **Five Postgres instances**, each private to its own project, none published.
+- **Port 3000 is taken** by `zaaka-pi-auction-app-1`.
 
-Two questions decide the rest of the week:
-
-1. **Which reverse proxy is in front, and is it managed or hand-rolled?** A
-   managed one (Caddy, nginx-proxy, Traefik) means Friday is a 30-minute job.
-   A hand-rolled nginx config with manual certbot means Friday is a Saturday.
-2. **Is there a Postgres already running, and what version?** If it is 14 or
-   newer, add a database to it. If it is older, or it is tuned for another
-   project's workload, run a second instance on another port instead.
+The rest of this document is written against those facts. An earlier draft
+assumed a host-installed proxy and a free port 3000; both were wrong.
 
 ## Wed — Snapshot, and prove the restore works
 
 Take the provider snapshot. Then actually restore it to a throwaway instance
 and boot it. A backup you have never restored is not a backup.
 
+There is no backup service in the running units, so check first whether a
+crontab is doing it — Wednesday assumes you are adding to a habit, and if
+there is no habit, that is the more important finding:
+
 ```sh
-# Existing databases, before you add anything
-pg_dumpall -U postgres | gzip > ~/pre-pitchside-$(date +%F).sql.gz
+crontab -l; sudo crontab -l; ls /etc/cron.d/
 ```
 
-Keep that dump off the box.
+Dump every database on the box before adding a sixth. Each lives in its own
+container, so each needs its own dump:
+
+```sh
+mkdir -p ~/pre-touchline-$(date +%F) && cd ~/pre-touchline-$(date +%F)
+for c in xnith-db-1 demo-demo-postgres-1 eternalguard-db-1 deploy-postgres-1; do
+  docker exec "$c" pg_dumpall -U postgres | gzip > "$c.sql.gz"
+done
+for c in cofifi-db-1 buddhapets-mariadb-1; do
+  docker exec "$c" sh -c 'mysqldump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"' \
+    | gzip > "$c.sql.gz"
+done
+ls -lh
+```
+
+Keep those dumps off the box. A snapshot that lives only on the machine it
+protects is not a backup either.
 
 ## Thu — Database
 
-Own database, own role, no superuser.
+Touchline gets **its own `postgres:16-alpine` container**, inside its own
+compose project, not a database inside one of the five that already run. The
+reasoning is in the inventory; the short version is that sharing an instance
+couples Touchline's uptime to another project's `docker compose down`.
 
-```sql
-CREATE ROLE pitchside WITH LOGIN PASSWORD 'generate-a-real-one';
-CREATE DATABASE pitchside OWNER pitchside;
-REVOKE ALL ON DATABASE pitchside FROM PUBLIC;
+No published port. The app reaches it by service name on the project network.
+
+```yaml
+# compose.yml — the database half
+services:
+  touchline-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: touchline
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it}
+      POSTGRES_DB: touchline
+    volumes:
+      - touchline-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U touchline"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+
+volumes:
+  touchline-pgdata:
 ```
 
-Then confirm the other projects are untouched:
+Apply the schema from inside the project network:
 
 ```sh
-psql -U postgres -c "\l"          # the other databases still there, same owners
-psql -U postgres -d <other_db> -c "\dt" | head
+docker compose run --rm \
+  -e DATABASE_URL=postgres://touchline:...@touchline-db:5432/touchline \
+  touchline-app npx drizzle-kit migrate
 ```
 
-Apply the schema:
+Expect **12 tables, 11 foreign keys, 24 indexes, 3 enum types**. Verify:
 
 ```sh
-DATABASE_URL=postgres://pitchside:...@127.0.0.1:5432/pitchside \
-  npx drizzle-kit migrate
+docker compose exec touchline-db psql -U touchline -d touchline -tAc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"
 ```
 
-12 tables, 11 foreign keys, 24 indexes, 3 enum types. Verify:
-
-```sql
-SELECT count(*) FROM information_schema.tables WHERE table_schema='public';
-```
-
-## Fri — Reverse proxy
-
-Add a vhost **beside** what is there. Do not replace the existing config, and
-do not install a second ACME client — the one already issuing certificates for
-the other projects issues this one too. Two certbots on one box fight over the
-same challenge directory and both fail at renewal, three months later, quietly.
-
-The app listens on a loopback port (3000 by default; pick another if taken —
-your Tuesday inventory says which are free). The proxy terminates TLS and
-forwards to it. Nothing but the proxy binds a public interface.
-
-Check renewal still works for everything, not just the new domain:
+Then confirm you changed nothing else — the other four Postgres containers
+should still be healthy and untouched:
 
 ```sh
-certbot renew --dry-run        # or: caddy reload && journalctl -u caddy -n 50
+docker ps --filter 'name=postgres' --filter 'name=db' \
+  --format '{{.Names}}\t{{.Status}}'
 ```
+
+## Fri — Caddy
+
+Caddy already terminates TLS for every site on the box and provisions
+certificates automatically. There is no certbot, nothing to renew by hand, and
+no second ACME client to install — installing one would fight the existing
+setup over the same challenge path and both would fail at renewal, quietly,
+months later.
+
+**First, name the network Caddy is on.** This is the one fact the inventory
+could not supply:
+
+```sh
+docker inspect deploy-caddy-1 \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}'
+```
+
+Join it as external, and keep the database on a separate internal network so
+Caddy cannot reach it:
+
+```yaml
+services:
+  touchline-app:
+    build: .
+    restart: unless-stopped
+    env_file: .env.production
+    depends_on:
+      touchline-db:
+        condition: service_healthy
+    expose: ["3000"]          # internal only — 3000 is taken on the host
+    networks: [internal, edge]
+
+networks:
+  internal:
+  edge:
+    external: true
+    name: <the network from the command above>
+```
+
+Then the site block in the `deploy` project's Caddyfile:
+
+```
+touchline.example.com {
+    encode zstd gzip
+    reverse_proxy touchline-app:3000
+}
+```
+
+Reload rather than restart, so the other sites never drop a request:
+
+```sh
+docker compose exec deploy-caddy-1 caddy reload --config /etc/caddy/Caddyfile
+docker logs --tail 50 deploy-caddy-1
+```
+
+Then check the other sites still answer, not just the new one. A bad Caddyfile
+takes down every site on the box, not only this one.
 
 ## Sat — Scaffold and pipeline
 
