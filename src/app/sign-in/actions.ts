@@ -5,7 +5,7 @@ import { db } from '@/db';
 import { users } from '@/db/schema';
 import { normalisePhone } from '@/lib/phone';
 import { issueChallenge } from '@/lib/otp';
-import { sendOtp } from '@/lib/sms';
+import { deliverOtp } from '@/lib/otp-delivery';
 
 export type RequestCodeState = {
   step: 'phone' | 'code';
@@ -35,9 +35,11 @@ export async function requestCode(
     };
   }
 
-  const sent = await sendOtp(phone, issued.code);
+  const sent = await deliverOtp(phone, issued.code);
   if (!sent.ok) {
-    // The challenge row stays; it expires on its own. Do not leak the reason.
+    // The challenge row stays; it expires on its own. Do not leak the reason
+    // to the browser — but do log it, because a delivery outage is invisible
+    // otherwise and looks like users mistyping their numbers.
     console.error('[sign-in] OTP delivery failed:', sent.error);
     return {
       step: 'phone',
